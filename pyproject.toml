@@ -1,0 +1,25 @@
+[project]
+name = "celclean"
+version = "0.1.0"
+description = "Clean AI-generated cel-shaded (flat-colour) anime art: remove grain/mottle, keep gradients and thin features"
+readme = "README.md"
+authors = [
+    { name = "ghost-him", email = "ghost-him@outlook.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.3",
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+celclean = "celclean.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
