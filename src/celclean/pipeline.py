@@ -19,8 +19,8 @@ import numpy as np
 
 from .color import lab_to_srgb, luma, srgb_to_lab
 from .ops import (
+    any_in_window,
     bilateral,
-    box_count,
     component_means,
     dilate,
     erode,
@@ -70,14 +70,14 @@ def clean(rgba: np.ndarray, opts: Options | None = None) -> tuple[np.ndarray, di
     alpha_raw = src[..., 3].copy()
     valid = alpha >= MIN_ALPHA
 
-    lab = srgb_to_lab(src[..., :3].astype(np.float32) / 255.0)
-    lab[~valid] = 0.0
+    lab = srgb_to_lab(src[..., :3])  # uint8 in -> exact sRGB->linear table inside
+    np.multiply(lab, valid[..., None], out=lab)  # transparent pixels must not leak into the means
 
     # ---- S1 noise scale
     sigma_lab = opts.sigma_grain
     if sigma_lab is None:
         sigma_lab = robust_sigma_luma(lab[..., 0], valid)
-    sigma_srgb = robust_sigma_luma(luma(src[..., :3].astype(np.float32)), valid)
+    sigma_srgb = robust_sigma_luma(luma(src[..., :3]), valid)
 
     radius = opts.radius if opts.radius is not None else auto_radius(w, h)
     sigma_range = float(np.clip(REF_SIGMA_RANGE * opts.strength, 0.5, 8.0))
@@ -117,19 +117,29 @@ def clean(rgba: np.ndarray, opts: Options | None = None) -> tuple[np.ndarray, di
 
     # ---- back to sRGB 8 bit
     out = np.empty_like(src)
-    out[..., :3] = np.clip(np.rint(lab_to_srgb(out_lab) * 255.0), 0, 255).astype(np.uint8)
+    rgb01 = lab_to_srgb(out_lab)
+    np.multiply(rgb01, 255.0, out=rgb01)
+    np.rint(rgb01, out=rgb01)
+    np.clip(rgb01, 0, 255, out=rgb01)
+    out[..., :3] = rgb01.astype(np.uint8)
     out[..., 3] = alpha_raw
+    # Below MIN_ALPHA the Lab round trip is meaningless (those pixels never enter any average),
+    # so they currently come back as the Lab origin — i.e. black. Keeping the source colour is
+    # what the alpha channel promises: an alpha=20 pixel over a white page is invisible, but a
+    # blackened one is a visible grey dot (measured on this image: 1166 px with >8 levels of
+    # change, worst 21.4, all of them this case — and all of them invisible to the masked
+    # metrics below, which is why they are also reported as "rendered" numbers now).
+    np.copyto(out[..., :3], src[..., :3], where=(~valid)[..., None])
 
     # ---- S4 alpha channel
-    interior = (alpha >= 248) & (box_count(alpha < 248, 1) == 0)
-    stray = (alpha <= 2) & (box_count(alpha > 2, 1) == 0)
+    interior = (alpha >= 248) & ~any_in_window(alpha < 248, 1)
+    stray = (alpha <= 2) & ~any_in_window(alpha > 2, 1)
     alpha_out = alpha_raw.copy()
     if opts.alpha_mode == "normalize":
         alpha_out[interior] = 255
     alpha_out[stray] = 0
     out[..., 3] = alpha_out
-    transparent = alpha_out == 0
-    out[transparent, :3] = 0
+    np.copyto(out[..., :3], np.uint8(0), where=(alpha_out == 0)[..., None])
 
     info = {
         "size": [w, h],

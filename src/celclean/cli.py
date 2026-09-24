@@ -132,7 +132,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--strength", type=float, default=1.0, help="1.0 = default, higher = flatter (default: 1.0)")
+        sp.add_argument("--strength", type=float, default=1.0,
+                        help="scales the colour-similarity threshold of the denoiser (default: 1.0). "
+                             "Measured: >1 does NOT make flat blocks cleaner, it only enlarges the "
+                             "worst-case change (max |d| 7.0 -> 21.3 levels at 3.0); for purer blocks "
+                             "use --stride 1 or --snap")
         sp.add_argument("--snap", action=argparse.BooleanOptionalAction, default=False,
                         help="repaint each connected flat block with exactly one colour; gives pure "
                              "blocks but turns gentle shading into visible steps (default: off)")
@@ -142,11 +146,18 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--min-block", type=int, default=64,
                         help="blocks smaller than this many px are left to the denoiser (default: 64)")
         sp.add_argument("--radius", type=int, default=None, help="core window radius in px (default: auto)")
-        sp.add_argument("--stride", type=int, default=2, help="window sampling step; 1 = slowest/best (default: 2)")
+        sp.add_argument("--stride", type=int, default=2,
+                        help="window sampling step (default: 2). 1 = 4x more taps and the measured "
+                             "quality work point: flat-pixel variation 0.0871 -> 0.0611, pure 3x3 "
+                             "neighbours 0.350 -> 0.463, max |d| 7.0 -> 8.0, ~3.4x the time")
         sp.add_argument("--sigma", type=float, default=None, help="override the measured grain sigma (Lab L units)")
         sp.add_argument("--alpha", choices=["normalize", "keep"], default="normalize",
-                        help="normalize: interior alpha -> 255 (default)")
-        sp.add_argument("--aa-band", type=int, default=2, help="px of edge kept un-snapped (default: 2)")
+                        help="normalize: interior alpha -> 255 (default). This changes more pixels "
+                             "than the denoising itself (253 -> 255 over 77%% of the image); 'keep' "
+                             "leaves alpha untouched")
+        sp.add_argument("--aa-band", type=int, default=2,
+                        help="px of edge kept un-snapped (default: 2); has an effect only together "
+                             "with --snap (with snap off the output is byte-identical)")
 
     c = sub.add_parser("clean", help="clean an image")
     c.add_argument("input")

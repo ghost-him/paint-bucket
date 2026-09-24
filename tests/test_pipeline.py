@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 
 from celclean import Options, clean
-from celclean.ops import box_mean
+from celclean.ops import any_in_window, box_count, box_mean, masked_box_mean
 
 
 def rgba_from(rgb: np.ndarray, alpha: int | np.ndarray = 255) -> np.ndarray:
@@ -40,6 +40,32 @@ def mottled_flat_block(color, size=160, grain=0.8, mottle=2.0, seed=0):
     field = field / max(1e-6, field.std()) * mottle
     noisy = color[None, None, :] + field[..., None] + rng.normal(0, grain, (size, size, 3))
     return np.clip(noisy, 0, 255)
+
+
+def test_masked_box_mean_2d_input_and_mask_semantics():
+    """A 2-D map (e.g. luma) must be accepted, and the mask must keep invalid pixels out.
+
+    `x` was multiplied against `valid[..., None]`, so a 2-D `x` broadcast into an (h, w, h) array:
+    a 1254x1254 call asked for 7.35 GiB. This test also pins the mask contract on a 64x64 map.
+    """
+    x = np.zeros((64, 64), np.float32)
+    x[:8, :8] = 1e6  # garbage outside the mask
+    valid = np.ones((64, 64), bool)
+    valid[:8, :8] = False
+
+    out = masked_box_mean(x, valid, 4)
+    assert out.shape == (64, 64, 1)
+    assert np.all(out == 0.0)  # the garbage never leaks, and nothing divides by a zero count
+
+    full = masked_box_mean(x, np.ones((64, 64), bool), 4)
+    assert np.array_equal(full[..., 0], box_mean(x, 4))  # an all-valid mask is the plain box mean
+
+
+def test_any_in_window_matches_the_counted_equivalent():
+    """The alpha stage asks "is there a non-opaque pixel in this 3x3 window"; this pins that OR == count != 0."""
+    mask = np.random.default_rng(5).random((40, 40)) < 0.2
+    for r in (1, 2):
+        assert np.array_equal(any_in_window(mask, r), box_count(mask, r) != 0)
 
 
 def test_grain_is_averaged_away():
@@ -160,3 +186,25 @@ def test_strength_stays_sane(strength: float):
     out, info = clean(src, Options(radius=12, stride=1, strength=strength))
     assert info["sigma_range"] == pytest.approx(min(8.0, max(0.5, 1.5 * strength)))
     assert np.corrcoef(luma(src)[40], luma(out)[40])[0, 1] > 0.98
+
+
+def test_alpha_below_min_keeps_its_colour():
+    """Pixels under MIN_ALPHA never enter any average, so the Lab round trip is meaningless for
+    them — writing the Lab origin there blackened the semi-transparent fringe of the silhouette.
+    Measured on the reference image before the fix: 1166 px changed by >8 levels, worst 21.4,
+    none of which the masked metrics could see (they peg the mask at alpha >= 24)."""
+    h = w = 64
+    src = np.zeros((h, w, 4), dtype=np.uint8)
+    src[..., 3] = 255
+    src[..., :3] = (200, 120, 60)
+    src[0:8, :, 3] = 20  # semi-transparent band: invisible on white when its colour survives
+    src[0:8, :, :3] = (240, 240, 240)
+    src[56:, 56:, 3] = 0  # fully transparent corner: colour must be cleared
+    src[56:, 56:, :3] = (7, 7, 7)
+
+    out, _ = clean(src, Options())
+
+    assert tuple(out[2, 2, :3]) == (240, 240, 240)
+    assert out[2, 2, 3] == 20
+    assert tuple(out[60, 60, :3]) == (0, 0, 0)
+    assert out[60, 60, 3] == 0

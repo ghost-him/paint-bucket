@@ -16,28 +16,98 @@ colour - a local average cannot remove variation that is *larger* than its windo
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 
+# Bands are the unit of cache blocking and of thread scheduling. The row count is picked per image:
+# enough bands to keep every worker busy for a couple of waves, but not so many rows that one
+# worker's live planes (lab band, numerator, product, weight, denominator - 20 bytes per pixel)
+# spill out of its share of the last level cache.
+_BAND_ROWS = 64
+_BAND_BYTES = 2_200_000
+_BAND_ROWS_MIN = 8
+_BAND_ROWS_MAX = 512
 
-def box_mean(a: np.ndarray, r: int) -> np.ndarray:
-    """Mean over a (2r+1)^2 window, reflect edges, O(N) via an integral image."""
+
+def row_bands(h: int, w: int | None = None, rows: int | None = None) -> list[tuple[int, int]]:
+    """Split [0, h) into bands of at most `rows` rows (chosen from the image size by default)."""
+    if rows is None:
+        rows = _BAND_ROWS
+        if w:
+            workers = os.cpu_count() or 1
+            balanced = -(-h // (2 * workers))
+            cache_cap = max(_BAND_ROWS_MIN, _BAND_BYTES // (20 * w))
+            rows = min(max(_BAND_ROWS_MIN, balanced), cache_cap, _BAND_ROWS_MAX)
+    return [(y0, min(h, y0 + rows)) for y0 in range(0, h, rows)]
+
+
+def run_bands(job, bands: list[tuple[int, int]]) -> list:
+    """Run `job(y0, y1)` for every band, one thread per band while there is more than one.
+
+    Bands are independent and the numpy kernels release the GIL, so threads give real parallelism
+    without the copy cost of processes. The result is what sequential execution would produce:
+    a band only ever reads its own rows (plus the halo) and writes its own rows. Returns the per
+    band return values in band order, so callers that reduce over bands stay race-free.
+    """
+    workers = min(len(bands), os.cpu_count() or 1)
+    if workers < 2:
+        return [job(*band) for band in bands]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return list(pool.map(lambda b: job(*b), bands))
+
+
+def box_mean(a: np.ndarray, r: int, out: np.ndarray | None = None) -> np.ndarray:
+    """Mean over a (2r+1)^2 window, reflect edges, O(N) via an integral image.
+
+    `out`, when given, receives the result: callers that already hold a buffer pass it to avoid
+    one more megapixel allocation per call.
+    """
     a = np.asarray(a, dtype=np.float32)
     squeeze = a.ndim == 2
     if squeeze:
         a = a[..., None]
-    h, w, _ = a.shape
+    h, w, c = a.shape
     pad = np.pad(a, ((r, r), (r, r), (0, 0)), mode="reflect")
     # integral image with a leading zero row/column: cum[i, j] == sum of pad[:i, :j]
-    cum = np.pad(np.cumsum(np.cumsum(pad, axis=0), axis=1), ((1, 0), (1, 0), (0, 0)))
+    cum = np.empty((h + 2 * r + 1, w + 2 * r + 1, c), dtype=np.float32)
+    cum[0, :, :] = 0.0  # the border the prefix sums start from (cheaper than zeroing the whole thing)
+    cum[:, 0, :] = 0.0
+    np.cumsum(pad, axis=0, out=cum[1:, 1:])
+    np.cumsum(cum, axis=1, out=cum)
     n = 2 * r + 1
-    s = cum[n : n + h, n : n + w] - cum[0:h, n : n + w] - cum[n : n + h, 0:w] + cum[0:h, 0:w]
-    out = s / float(n * n)
-    return out[..., 0] if squeeze else out
+    if out is None:
+        out = np.empty((h, w) if squeeze else (h, w, c), dtype=np.float32)
+    view = out.reshape(h, w, 1) if squeeze else out
+    np.subtract(cum[n : n + h, n : n + w], cum[0:h, n : n + w], out=view)
+    np.subtract(view, cum[n : n + h, 0:w], out=view)
+    np.add(view, cum[0:h, 0:w], out=view)
+    np.divide(view, float(n * n), out=view)
+    return out
 
 
 def box_count(mask: np.ndarray, r: int) -> np.ndarray:
     """Number of True entries in a (2r+1)^2 window."""
     return box_mean(np.asarray(mask, dtype=np.float32), r) * float((2 * r + 1) ** 2)
+
+
+def any_in_window(mask: np.ndarray, r: int) -> np.ndarray:
+    """True where any pixel of the (2r+1)^2 neighbourhood of `mask` is True, reflect edges.
+
+    Equivalent to `box_count(mask, r) != 0` but only a handful of boolean passes, which is what
+    the alpha stage asks for ("is there a non-opaque pixel anywhere in this 3x3 window").
+    """
+    m = np.asarray(mask, dtype=bool)
+    h, w = m.shape
+    pad = np.pad(m, r, mode="reflect")
+    acc = pad[0:h, 0:w].copy()
+    for i in range(2 * r + 1):
+        for j in range(2 * r + 1):
+            if i == 0 and j == 0:
+                continue
+            np.logical_or(acc, pad[i : i + h, j : j + w], out=acc)
+    return acc
 
 
 def dilate(mask: np.ndarray, radius: int = 1) -> np.ndarray:
@@ -161,6 +231,12 @@ def bilateral(
     sigma_spatial spatial sigma, default radius/2
     stride        sample every `stride`-th offset inside the window (an approximation that is
                   accurate while sigma_spatial >> stride)
+
+    The window loop is the whole cost of the pipeline, so it is organised around memory traffic
+    rather than around the formula: the image is processed in row bands that stay in cache, the
+    per-offset temporaries are preallocated and written through `out=`, and the bands are spread
+    over the available cores. Every offset is still accumulated in the same order with the same
+    float32 operations, so the result is bit-for-bit what the plain full-image loop produced.
     """
     lab = np.asarray(lab, dtype=np.float32)
     valid = np.asarray(valid, dtype=bool)
@@ -182,22 +258,47 @@ def bilateral(
     pad_ok = np.pad(valid, ((r, r), (r, r)), mode="constant")
     inv_range = np.float32(1.0 / (2.0 * sigma_range * sigma_range))
     inv_space = np.float32(1.0 / (2.0 * sigma_spatial * sigma_spatial))
+    spatial = np.array(
+        [np.exp(-(dy * dy + dx * dx) * inv_space) for dy, dx in offsets], dtype=np.float32
+    )
 
     num = np.zeros_like(lab)
     den = np.zeros((h, w), dtype=np.float32)
-    for dy, dx in offsets:
-        sl = pad_lab[r + dy : r + dy + h, r + dx : r + dx + w]
-        ok = pad_ok[r + dy : r + dy + h, r + dx : r + dx + w]
-        diff = lab - sl
-        d2 = diff[..., 0] * diff[..., 0] + diff[..., 1] * diff[..., 1] + diff[..., 2] * diff[..., 2]
-        weight = np.exp(-d2 * inv_range)
-        weight *= np.float32(np.exp(-(dy * dy + dx * dx) * inv_space))
-        weight *= ok
-        num += weight[..., None] * sl
-        den += weight
+
+    def run(y0: int, y1: int) -> None:
+        bh = y1 - y0
+        lab_b = lab[y0:y1]
+        num_b = num[y0:y1]
+        den_b = den[y0:y1]
+        diff = np.empty((bh, w, 3), dtype=np.float32)
+        d2 = np.empty((bh, w), dtype=np.float32)
+        prod = np.empty((bh, w, 3), dtype=np.float32)
+        for tap, (dy, dx) in enumerate(offsets):
+            sl = pad_lab[r + y0 + dy : r + y1 + dy, r + dx : r + dx + w]
+            ok = pad_ok[r + y0 + dy : r + y1 + dy, r + dx : r + dx + w]
+            np.subtract(lab_b, sl, out=diff)
+            np.multiply(diff[..., 0], diff[..., 0], out=d2)
+            np.multiply(diff[..., 1], diff[..., 1], out=diff[..., 1])
+            np.add(d2, diff[..., 1], out=d2)
+            np.multiply(diff[..., 2], diff[..., 2], out=diff[..., 2])
+            np.add(d2, diff[..., 2], out=d2)
+            np.multiply(d2, -inv_range, out=d2)
+            np.exp(d2, out=d2)
+            np.multiply(d2, spatial[tap], out=d2)
+            np.multiply(d2, ok, out=d2)
+            np.multiply(d2[..., None], sl, out=prod)
+            np.add(num_b, prod, out=num_b)
+            np.add(den_b, d2, out=den_b)
+
+    run_bands(run, row_bands(h, w))
+
     # if nothing similar enough was found around a pixel (isolated speck / 1 px feature),
     # keep the pixel instead of amplifying numerical noise, and never let the weights vanish
-    return np.where(den[..., None] < 0.5, lab, num / np.maximum(den, 1e-3)[..., None])
+    unweighted = den < np.float32(0.5)
+    np.maximum(den, np.float32(1e-3), out=den)
+    np.divide(num, den[..., None], out=num)
+    np.copyto(num, lab, where=unweighted[..., None])
+    return num
 
 
 def component_means(lab: np.ndarray, labels: np.ndarray, count: int) -> np.ndarray:
@@ -226,28 +327,61 @@ def gradient_magnitude(x: np.ndarray) -> np.ndarray:
 def robust_sigma_luma(gray: np.ndarray, valid: np.ndarray, flat_range: float = 3.0) -> float:
     """Per-pixel noise sigma from the 3x3 Laplacian, restricted to locally flat pixels.
 
-    The median (not the mean) over flat pixels keeps edges from inflating the estimate.
+    The median (not the mean) over flat pixels keeps edges from inflating the estimate. The
+    Laplacian, the local range and the selection are computed band by band (the 9-window stack
+    used to allocate nine full-size planes, which dominated the runtime of a 4096x4096 image),
+    and only the surviving |Laplacian| values are concatenated for the median.
     """
     gray = np.asarray(gray, dtype=np.float32)
     h, w = gray.shape
-    lap = np.zeros_like(gray)
-    lap[1:-1, 1:-1] = (
-        gray[:-2, 1:-1] + gray[2:, 1:-1] + gray[1:-1, :-2] + gray[1:-1, 2:] - 4.0 * gray[1:-1, 1:-1]
-    )
-    win = np.stack([gray[i : i + h - 2, j : j + w - 2] for i in range(3) for j in range(3)], axis=-1)
-    rng = win.max(-1) - win.min(-1)
-    sel = (rng < flat_range) & valid[1:-1, 1:-1]
-    if sel.sum() < 64:
+    if h < 3 or w < 3:
         return 0.0
-    return float(np.sqrt(np.pi / 2.0) / 6.0 * np.median(np.abs(lap[1:-1, 1:-1][sel])))
+
+    def band(y0: int, y1: int) -> np.ndarray:
+        seg = gray[y0 - 1 : y1 + 1]  # the output rows need one row of halo on each side
+        lap = (
+            seg[:-2, 1:-1] + seg[2:, 1:-1] + seg[1:-1, :-2] + seg[1:-1, 2:] - 4.0 * seg[1:-1, 1:-1]
+        )
+        # local range: max/min over the 3x3 window, folded in place instead of stacking nine planes
+        bh = y1 - y0
+        rng = np.array(seg[0:bh, 0 : w - 2], dtype=np.float32, copy=True)
+        lo = rng.copy()
+        for i in range(3):
+            for j in range(3):
+                if i == 0 and j == 0:
+                    continue
+                win = seg[i : i + bh, j : j + w - 2]
+                np.maximum(rng, win, out=rng)
+                np.minimum(lo, win, out=lo)
+        np.subtract(rng, lo, out=rng)
+        sel = (rng < flat_range) & valid[y0:y1, 1:-1]
+        return np.abs(lap)[sel]
+
+    # the collectable rows are the interior ones, and `sel` (like `lap[1:-1]`) lives on those rows
+    pieces = [p for p in run_bands(band, [((y0 + 1), (y1 + 1)) for y0, y1 in row_bands(h - 2, w)]) if p.size]
+    if sum(p.size for p in pieces) < 64:
+        return 0.0
+    return float(np.sqrt(np.pi / 2.0) / 6.0 * np.median(np.concatenate(pieces)))
 
 
 def masked_box_mean(x: np.ndarray, valid: np.ndarray, r: int) -> np.ndarray:
-    """Box mean that ignores pixels outside `valid` (so transparent/garbage pixels cannot leak)."""
+    """Box mean that ignores pixels outside `valid` (so transparent/garbage pixels cannot leak).
+
+    Works for 2-D input too (e.g. a luminance map) and then returns (h, w, 1): the caller gets one
+    masked mean per pixel per channel, and no accidental (h, w, h) broadcast of x against valid.
+    """
     m = np.asarray(valid, dtype=np.float32)
-    num = box_mean(np.asarray(x, dtype=np.float32) * m[..., None], r)
-    den = np.maximum(box_mean(m, r), 1e-6)
-    return num / den[..., None]
+    x = np.asarray(x, dtype=np.float32)
+    if x.ndim == 2:
+        x = x[..., None]
+    h, w, c = x.shape
+    # the mask rides along as one extra channel: a single integral image instead of two
+    stacked = np.empty((h, w, c + 1), dtype=np.float32)
+    np.multiply(x, m[..., None], out=stacked[..., :c])
+    stacked[..., c] = m
+    acc = box_mean(stacked, r)
+    den = np.maximum(acc[..., c], 1e-6)
+    return acc[..., :c] / den[..., None]
 
 
 def grow_labels(

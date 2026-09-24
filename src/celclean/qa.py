@@ -86,9 +86,17 @@ def image_metrics(orig_rgba: np.ndarray, out_rgba: np.ndarray, tiles: int = 8) -
 
     v = valid.copy()
     v[out[..., 3] == 0] = False
+    # Coverage for everything the masked numbers cannot see: alpha compositing on a white page
+    # over EVERY pixel. The masked rows above once hid a real artefact class (alpha in [8,24)
+    # whose RGB was written black: 1166 px changed by >8 levels, worst 21.4 — invisible above).
+    dren = np.abs(_rendered_luma(out) - _rendered_luma(orig))
     return {
         "size": [w, h],
         "pixels_valid": int(v.sum()),
+        "rendered_max_abs_delta_levels": round(float(dren.max()), 3),
+        "rendered_mean_abs_delta_levels": round(float(dren.mean()), 3),
+        "rendered_p99_abs_delta_levels": round(float(np.percentile(dren, 99)), 3),
+        "rendered_frac_gt8_levels": round(float((dren > 8).mean()), 5),
         "sigma_grain_before_levels": round(float(robust_sigma_luma(lo, valid)), 4),
         "sigma_grain_after_levels": round(float(robust_sigma_luma(lc, v)), 4),
         "flat_tiles": tile_rows,
@@ -115,6 +123,14 @@ def _white_bg(np_rgba: np.ndarray) -> Image.Image:
     img = Image.fromarray(np_rgba, "RGBA")
     bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
     return Image.alpha_composite(bg, img).convert("RGB")
+
+
+def _rendered_luma(np_rgba: np.ndarray) -> np.ndarray:
+    """Luma of the image as a viewer sees it on a white page, for every pixel including the
+    transparent ones (alpha compositing, exact)."""
+    a = np_rgba[..., 3].astype(np.float32) / 255.0
+    rgb = np_rgba[..., :3].astype(np.float32)
+    return luma(255.0 - a[..., None] * (255.0 - rgb))
 
 
 def _boost(img: Image.Image) -> tuple[Image.Image, float]:
