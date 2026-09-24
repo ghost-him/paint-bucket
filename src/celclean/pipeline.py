@@ -57,11 +57,53 @@ class Options:
     # and it never touched the real gradients (blush correlation 0.9993 for every setting).
     stride: int = 1  # offset subsampling inside the bilateral window
     sigma_grain: float | None = None  # None = measure it
-    alpha_mode: str = "normalize"  # "normalize" | "keep"
+    alpha_mode: str = "normalize"  # "normalize" | "keep" | "flatten"
+    # only read by alpha_mode == "flatten": the solid colour transparency is composited onto
+    bg_color: tuple[int, int, int] = (255, 255, 255)
     aa_band: int = 2  # px of the flat mask eroded before snapping (protects anti-aliasing)
     snap_mode: str = "plane"  # "plane" = fit a plane per block, "constant" = one colour per block
     plane_tol: float = 4.0  # keep a block if its plane residual <= plane_tol x the median residual
     slope_tol: float = 0.05  # max slope difference (dE/px) for two adjacent blocks to merge
+
+
+NAMED_COLORS: dict[str, tuple[int, int, int]] = {"white": (255, 255, 255), "black": (0, 0, 0)}
+
+
+def parse_color(value: str | tuple[int, int, int]) -> tuple[int, int, int]:
+    """`#rrggbb`, `rrggbb`, `#rgb`, `white`/`black` or an RGB triple -> (r, g, b)."""
+    if isinstance(value, (tuple, list)):
+        channels = tuple(int(v) for v in value)
+        if len(channels) != 3 or not all(0 <= v <= 255 for v in channels):
+            raise ValueError(f"expected three channels in 0..255, got {value!r}")
+        return channels  # type: ignore[return-value]
+    text = str(value).strip().lower()
+    if text in NAMED_COLORS:
+        return NAMED_COLORS[text]
+    digits = text[1:] if text.startswith("#") else text
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    if len(digits) != 6 or any(c not in "0123456789abcdef" for c in digits):
+        raise ValueError(f"expected #rrggbb (or white/black), got {value!r}")
+    return (int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16))
+
+
+def flatten(rgba: np.ndarray, color: tuple[int, int, int] = (255, 255, 255)) -> np.ndarray:
+    """Composite the image onto a solid colour and make it fully opaque.
+
+    A real composite, not "paint the transparent pixels": the RGB under transparency is garbage
+    (after the alpha stage it is black), and the 1-2 px anti-aliasing ramp is exactly the blend
+    that has to survive.  Painting instead of compositing leaves that ramp dark -- the classic
+    black fringe.  `np.rint` keeps the result from drifting half a level darker.
+    """
+    src = np.asarray(rgba)
+    alpha = (src[..., 3].astype(np.float32) / 255.0)[..., None]
+    background = np.asarray(color, dtype=np.float32)[None, None, :]
+    mixed = src[..., :3].astype(np.float32) * alpha
+    mixed += (1.0 - alpha) * background
+    out = np.empty_like(src)
+    out[..., :3] = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
+    out[..., 3] = 255
+    return out
 
 
 def auto_radius(width: int, height: int) -> int:
@@ -179,6 +221,10 @@ def clean(rgba: np.ndarray, opts: Options | None = None) -> tuple[np.ndarray, di
     out[..., 3] = alpha_out
     np.copyto(out[..., :3], np.uint8(0), where=(alpha_out == 0)[..., None])
 
+    # ---- S5 optional: give the transparency a solid background (fully opaque output)
+    if opts.alpha_mode == "flatten":
+        out = flatten(out, opts.bg_color)
+
     info = {
         "size": [w, h],
         "sigma_grain_lab": round(float(sigma_lab), 4),
@@ -190,6 +236,7 @@ def clean(rgba: np.ndarray, opts: Options | None = None) -> tuple[np.ndarray, di
         "snapped_px": snapped_px,
         "snapped_blocks": snapped_blocks,
         "alpha_mode": opts.alpha_mode,
+        "bg_color": list(opts.bg_color),
         "alpha_interior_snapped_px": int((interior & (alpha_raw != 255)).sum()),
         "alpha_stray_zeroed_px": int((stray & (alpha_raw != 0)).sum()),
         "options": asdict(opts),

@@ -17,6 +17,7 @@
 9. [已知失效模式与边界](#9-已知失效模式与边界)
 10. [复现](#10-复现)
 11. [设计演进与变更记录](#11-设计演进与变更记录)
+12. [图形界面与打包](#12-图形界面与打包)
 
 ---
 
@@ -94,7 +95,8 @@
 | `min_block` | 64 px | 小于此像素数的块不重刷 | 保护小碎块细节 |
 | `aa_band` | 2 px | 块边缘保留不重刷的宽度 | **只在 `snap` 打开时有效**（关掉时输出逐字节相同） |
 | `merge_tol` | 1.0 dE | 相邻块颜色差 ≤ 此值则合并成一块 | 防止块间留下 1 色阶平台 |
-| `alpha_mode` | normalize | 内部 alpha → 255 | 它改动的像素数**比去噪本身多**（约 77% 像素各 1–2 色阶）；这是"修 AI 脏 alpha"的必要代价，可用 `keep` 关掉 |
+| `alpha_mode` | normalize | 内部 alpha → 255；`keep` 原样；`flatten` 再合成到纯色上并输出不透明 | 归一改动的像素数**比去噪本身多**（约 77% 像素各 1–2 色阶）；这是"修 AI 脏 alpha"的必要代价，可用 `keep` 关掉 |
+| `bg_color` | `(255,255,255)` | `flatten` 的底色（`#rrggbb` / `white` / `black`） | **只在 `flatten` 时生效**（与 `aa_band` 之于 `snap` 同一规则）。必须是直通合成 `rint(a·rgb + (1−a)·bg)`，不是"把透明像素刷成底色"——后者会让 1–2 px 的抗锯齿斜坡留下黑边（第 9 节） |
 | `plane_tol` / `slope_tol` | 4.0 / 0.05 | 平面判据倍数 / 合并坡度容差 | 见 2.1 |
 
 ---
@@ -114,6 +116,14 @@
 | `frac_gt8_levels` | 改动 > 8 色阶的像素占比（同上掩码） | 可见改动的上界 |
 | `rendered_*`（v2 新增） | **白底合成、全像素**的 max/p99/mean/>8 色阶 | **口径补漏**：α≥24 掩码会把 α<24 的边缘像素排除在统计之外，而那里曾藏着全图最大的单像素改动（21.4 色阶）。现在两行都给 |
 | `max_deltaE_flat_px` | 平坦像素上 99 分位 Lab ΔE | 与人眼感受对齐的补充 |
+
+**`flatten` 模式下的两处口径调整**（否则报告会把"有意换背景"当成缺陷）：
+
+1. `rendered_*` 行改为在**输出自己的底色**上合成（`render_background`），默认仍是白底。
+2. 掩码行改为**拿合成后的原图比合成后的输出**（`composite_original`）——半透明像素本来就该变成背景色，
+   不这样处理时实测 `max|d|` 会显示 199.4 色阶、>8 色阶 0.81%，把"去噪到底有多温和"这个问题整个盖住；
+   合成后同一张图是 `max|d| 8.0`、>8 色阶 0.00%。**内容掩码始终按原图的 α≥24 定义**，所以数字与已发布的基线仍然可比
+   （注意 alpha 阈值取 255 是错的：这张图内部 alpha 众数是 253，α≥255 只剩 0.09% 的像素）。
 
 **曾骗过我们的两件事（记录在案）**：
 
@@ -345,3 +355,83 @@ uv run celclean clean avator.png --snap --snap-mode constant -o pure_const.png  
 - `--snap` 的默认模型换成 **plane**（常数模型会把一条缓坡整条刷平）；平面判据改为**相对中位残差**（绝对阈值恰好拒掉了最该重刷的块）。
 - 仍不把 `snap` 设为默认：两种块模型都会在大片柔和渐变上留下硬边色斑（目视验证），尽管全局指标更"漂亮"。
 - 被数据否掉并不再尝试的方向：半径按"测得的噪声相关长度"自适应、`--strength` 当纯度旋钮、H1/H2/H3 三个增强原型（详见第 9 节与 `_probe/enhance/REPORT.md`）。
+
+---
+
+## 12. 图形界面与打包
+
+### 12.1 位置与决策
+
+桌面版在 `src/celclean/gui/`——**`celclean` 的子包**，不是 `src/` 下平级的第二个包。原因：构建后端 uv_build
+是单模块 wheel，`[tool.uv.build-backend] module-names` 在 0.9.26 上**被静默忽略**（实测：写上之后构建照样成功，
+但 wheel 里仍然只有 `celclean/`），而放进包内是零配置。PySide6 只在导入 GUI 时才需要，所以它是可选依赖：
+`uv sync --extra gui` / `pip install "celclean[gui]"`；核心算法与 CLI 不依赖 Qt。
+
+| 文件 | 职责 |
+|---|---|
+| `gui/app.py` | 主窗口、菜单与工具栏、文件打开/保存、批处理与测量的调度、`--selftest` |
+| `gui/view.py` | 缩放/平移的图像面板、棋盘透明背景、「噪点放大」detail 视图 |
+| `gui/params.py` | 参数控件 ↔ `Options` 映射、预设档位、预计耗时、QSettings 持久化 |
+| `gui/jobs.py` | 后台任务（单图 / 批处理 / 测量）：`QRunnable` + 信号 |
+| `gui/batch.py` | 批处理对话框与文件收集 |
+
+### 12.2 线程模型
+
+- `clean()` 跑在 `QThreadPool` 的 worker 上，GUI 线程只做显示；结果通过信号回来。
+- 每个任务带序号，回来时序号不是最新就**丢弃**：连着拖参数不会用旧结果覆盖新预览。
+- 自动预览 600 ms 防抖；任务在跑时新的参数改动只记一个 pending，跑完立刻用最新参数重跑一次（不排队堆积）。
+- 单图**不能中途取消**（流水线没有进度钩子），所以不提供取消按钮，改为显示已用时间 + 预计耗时；
+  批处理的取消在**文件之间**生效（当前这张会跑完）。
+- 预计耗时 `3.0 s × (像素/1.57 M)^1.40`，stride 2 除以 3.4、snap 乘以 5。指数 1.40 来自实测比值：
+  1254² 3.0 s、4096² 82.9 s（像素 10.7 倍，时间 27.6 倍）。
+
+### 12.3 「噪点放大」为什么不是对比拉伸
+
+显示 `clip(128 + gain × (rgb − box_mean(rgb, 2)), 0, 255)`，单位就是色阶；field 按图缓存，拖增益只重渲染。
+
+| 试过的做法 | 结果 |
+|---|---|
+| 整图线性拉伸（`qa._boost` 的局部裁图公式） | **不成立**：平坦块在各个亮度上都存在，汇总的四分位距跨了黑帽子到白底，增益塌到 1×，什么都看不见 |
+| 按局部起伏归一化 `(rgb − mean)/max(local_std, eps)` | **方向错了**：清理后的平坦区残余很小，除以它自己变小的 local_std 又被放大回来——左右对比只剩 1.2×，恰好掩盖了这个视图要展示的差别 |
+| **现在的 level 残差版** | 平坦块纹理**实测 0.489 → 0.168 色阶（3×）**，显示幅度与真实去噪量成正比；自动增益按「最平的十分之一 32×32 块」定标（样图给出 30×） |
+
+成本：1254² ≈ 0.13 s、4096² ≈ 1.1 s（field 0.82 + 定标 0.26 + 渲染 0.25），首次打开用等待光标。
+半透明像素沿用原 alpha，所以棋盘背景与透明区域的表现不变。
+
+### 12.4 打包
+
+`packaging/celclean-gui.spec`（onefile、windowed、无控制台）+ `packaging/make_icon.py`（图标）。
+
+- 产物 **65.8 MB**；从启动到出现窗口 ≈ **3.2 s**（onefile 每次要把自己解包到临时目录），工作本身仍是 3.0 s。
+- `excludes` 里列了不用的 PySide6 模块（WebEngine / QML / Quick / 3D / Multimedia / SQL / …）与 tkinter、scipy、
+  pytest 等压舱物。**改了这个清单就必须重跑 `--selftest`**：缺依赖会在启动或首次绘制时立刻炸。
+- 冻结版与源码版产出的 PNG **逐字节相同**（sha256 `dd0c083356411bd1…`）。
+- `--selftest` 覆盖：建窗口 → 载入 → 后台任务 → 两栏 QImage → 1:1 与 detail 截图 → 保存结果 → JSON 报告
+  （ok / 尺寸 / 耗时 / info / 字节数 / 状态栏文本）。另外用真实 `BatchJob` 跑过 2 个正常文件 + 1 个损坏文件：
+  2 成功、1 跳过并汇总，输出与 JSON 报告齐全，坏文件不会中断批处理。
+
+复现命令：
+
+```bash
+uv sync --extra gui
+uv run --extra gui celclean-gui --selftest --out-dir check       # 源码版自检（offscreen，不弹窗）
+uv run --extra gui --group pack pyinstaller --noconfirm --clean packaging/celclean-gui.spec
+dist/celclean-gui.exe --selftest --selftest-out check.json --out-dir check
+```
+
+### 12.5 便携（绿色）模式
+
+规则在 `gui/paths.py`（纯文件系统逻辑，不依赖 Qt，单测在 `tests/test_gui_paths.py`）：
+
+| 条件 | 配置位置 |
+|---|---|
+| `--portable`,或 `CELCLEAN_PORTABLE=1` | `<exe 目录>/celclean.ini`（不检查可写性：用户明确要求了） |
+| 打包版 + 目录可写（**默认**） | `<exe 目录>/celclean.ini` |
+| 打包版 + 目录不可写（如 `C:\Program Files`） | 回退注册表 `HKCU\Software\celclean\celclean-gui` |
+| 源码运行 | 注册表（`--portable` 可改） |
+
+- 可写性是**探测**出来的（往目标文件 `open(..., "a")`），不是按权限猜。
+- 实测（打包版自检）：先删掉 `HKCU\Software\celclean`，跑完自检后 exe 旁边出现 `celclean.ini`
+  （含 `[window]` / `[params]` 两段），注册表键**始终没有重新出现** —— 可写目录下运行时零系统痕迹。
+- 进程外唯一的写入是 onefile 的解包临时目录（退出即删）；结果图片只写用户指定的路径。
+- 自检 JSON 里 `portable_flag` 表示是否传了参数，`portable_active` 表示最终是否走了便携路径。

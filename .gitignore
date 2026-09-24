@@ -2,3 +2,6 @@ _probe
 .pytest_cache
 examples
 *__pycache__*
+dist
+build
+celclean.ini

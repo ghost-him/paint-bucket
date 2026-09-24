@@ -12,8 +12,14 @@ dependencies = [
     "pillow>=12.3.0",
 ]
 
+[project.optional-dependencies]
+gui = [
+    "pyside6>=6.8",
+]
+
 [project.scripts]
 celclean = "celclean.cli:main"
+celclean-gui = "celclean.gui:main"
 
 [build-system]
 requires = ["uv_build>=0.9.26,<0.10.0"]
@@ -22,4 +28,7 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+]
+pack = [
+    "pyinstaller>=6.11",
 ]

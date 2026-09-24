@@ -14,10 +14,9 @@ import numpy as np
 from PIL import Image
 
 from . import __version__
-from .pipeline import Options, clean
-from .qa import image_metrics, pick_crops, write_comparison, write_report
-
-Image.MAX_IMAGE_PIXELS = None
+from .io import load_rgba, save_rgba
+from .pipeline import Options, clean, parse_color
+from .qa import image_metrics, metrics_text, pick_crops, write_comparison, write_report
 
 
 def _parse_crops(values: list[str] | None) -> list[tuple[int, int, int, int]] | None:
@@ -32,11 +31,22 @@ def _parse_crops(values: list[str] | None) -> list[tuple[int, int, int, int]] | 
     return crops
 
 
-def _load(path: str | Path) -> np.ndarray:
-    img = Image.open(path)
-    if img.mode != "RGBA":
-        img = img.convert("RGBA")
-    return np.asarray(img)
+def _color(text: str) -> tuple[int, int, int]:
+    """argparse type for --bg-color: report a bad value the way argparse likes it."""
+    try:
+        return parse_color(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _background(opts: Options) -> tuple[int, int, int]:
+    """What to render both sides over: the output's own colour when flattening, else white."""
+    return tuple(opts.bg_color) if opts.alpha_mode == "flatten" else (255, 255, 255)
+
+
+def _composite_original(opts: Options) -> tuple[int, int, int] | None:
+    """A flattened output is compared against a flattened original (see qa.image_metrics)."""
+    return tuple(opts.bg_color) if opts.alpha_mode == "flatten" else None
 
 
 def _options(args: argparse.Namespace) -> Options:
@@ -49,6 +59,7 @@ def _options(args: argparse.Namespace) -> Options:
         stride=args.stride,
         sigma_grain=args.sigma,
         alpha_mode=args.alpha,
+        bg_color=args.bg_color,
         aa_band=args.aa_band,
         snap_mode=args.snap_mode,
         plane_tol=args.plane_tol,
@@ -66,13 +77,16 @@ def cmd_clean(args: argparse.Namespace) -> int:
     if not src.exists():
         raise SystemExit(f"no such file: {src}")
     out_path = Path(args.output) if args.output else _default_output(src, args.suffix)
-    rgba = _load(src)
-    cleaned, info = clean(rgba, _options(args))
-    Image.fromarray(cleaned, "RGBA").save(out_path)
+    rgba = load_rgba(src)
+    opts = _options(args)
+    cleaned, info = clean(rgba, opts)
+    save_rgba(cleaned, out_path)
     print(f"wrote {out_path}  ({info['size'][0]}x{info['size'][1]}, radius={info['radius']}, "
           f"sigma_range={info['sigma_range']}, snap={info['snap']})")
     if args.report:
-        metrics = image_metrics(rgba, cleaned)
+        metrics = image_metrics(
+            rgba, cleaned, background=_background(opts), composite_original=_composite_original(opts)
+        )
         report_path = (
             Path(args.report) if args.report != "auto" else src.with_name(f"{src.stem}-report.json")
         )
@@ -86,44 +100,36 @@ def cmd_compare(args: argparse.Namespace) -> int:
     src = Path(args.input)
     if not src.exists():
         raise SystemExit(f"no such file: {src}")
-    rgba = _load(src)
+    rgba = load_rgba(src)
+    opts = _options(args)
     if args.cleaned:
         cleaned_path = Path(args.cleaned)
         if not cleaned_path.exists():
             raise SystemExit(f"no such file: {cleaned_path}")
-        cleaned = _load(cleaned_path)
+        cleaned = load_rgba(cleaned_path)
     else:
-        cleaned, info = clean(rgba, _options(args))
+        cleaned, info = clean(rgba, opts)
         cleaned_path = _default_output(src, args.suffix)
-        Image.fromarray(cleaned, "RGBA").save(cleaned_path)
+        save_rgba(cleaned, cleaned_path)
         print(f"wrote {cleaned_path} (cleaned on the fly)")
 
     crops = _parse_crops(args.crop)
     if crops is None and not args.no_auto_crop:
         crops = pick_crops(rgba, cleaned)
     out_dir = Path(args.out_dir) if args.out_dir else src.with_name(src.stem + "-compare")
-    files = write_comparison(rgba, cleaned, out_dir, crops=crops, zoom=args.zoom)
+    files = write_comparison(rgba, cleaned, out_dir, crops=crops, zoom=args.zoom, background=_background(opts))
     for f in files:
         print(f"wrote {f}")
-    metrics = image_metrics(rgba, cleaned)
+    metrics = image_metrics(
+        rgba, cleaned, background=_background(opts), composite_original=_composite_original(opts)
+    )
     write_report(metrics, {"input": str(src), "cleaned": str(cleaned_path)}, out_dir / "report.json")
     _print_metrics(metrics)
     return 0
 
 
 def _print_metrics(m: dict) -> None:
-    print("\n--- measured (acceptance protocol) ---")
-    print(f"  flattest tiles ({len(m['flat_tiles'])}x 32x32): std {m['flat_tile_std_before_mean']} -> "
-          f"{m['flat_tile_std_after_mean']} mean, {m['flat_tile_std_after_median']} median; "
-          f"{m['flat_tiles_cleaned']} are now flat (std<=0.1); worst colour bias "
-          f"{m['flat_tile_bias_absmax']} levels")
-    print(f"  local variation on flat pixels: {m['local_variation_flat_px_before']} -> "
-          f"{m['local_variation_flat_px_after']}")
-    print(f"  grain sigma (levels): {m['sigma_grain_before_levels']} -> {m['sigma_grain_after_levels']}")
-    print(f"  luma corr {m['corr_luma']}  mean|d| {m['mean_abs_delta_levels']}  "
-          f"p99|d| {m['p99_abs_delta_levels']}  max|d| {m['max_abs_delta_levels']}")
-    print(f"  pixels changed >2 levels {100 * m['frac_gt2_levels']:.2f}%  "
-          f">8 levels {100 * m['frac_gt8_levels']:.2f}%")
+    print(metrics_text(m))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -157,10 +163,15 @@ def build_parser() -> argparse.ArgumentParser:
                              "neighbourhoods 0.554 vs 0.464, worst-case change 7.0 -> 8.0 levels) at "
                              "~3.4x the time; use 2 to trade purity back for speed")
         sp.add_argument("--sigma", type=float, default=None, help="override the measured grain sigma (Lab L units)")
-        sp.add_argument("--alpha", choices=["normalize", "keep"], default="normalize",
+        sp.add_argument("--alpha", choices=["normalize", "keep", "flatten"], default="normalize",
                         help="normalize: interior alpha -> 255 (default). This changes more pixels "
                              "than the denoising itself (253 -> 255 over 77%% of the image); 'keep' "
-                             "leaves alpha untouched")
+                             "leaves alpha untouched; 'flatten' also composites the whole image onto "
+                             "one solid colour (--bg-color) and drops the alpha channel, so the "
+                             "output is an opaque RGB PNG")
+        sp.add_argument("--bg-color", type=_color, default=(255, 255, 255), metavar="#RRGGBB",
+                        help="background for --alpha flatten (default: #ffffff; also accepts "
+                             "'white'/'black' or R,G,B); ignored by the other alpha modes")
         sp.add_argument("--aa-band", type=int, default=2,
                         help="px of edge kept un-snapped (default: 2); has an effect only together "
                              "with --snap (with snap off the output is byte-identical)")

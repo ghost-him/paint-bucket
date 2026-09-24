@@ -5,7 +5,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from celclean import Options, clean
+from PIL import Image
+
+from celclean import Options, clean, flatten, parse_color
+from celclean.qa import image_metrics
 from celclean.ops import any_in_window, box_count, box_mean, masked_box_mean
 
 
@@ -278,3 +281,95 @@ def test_plane_snap_leaves_a_non_planar_block_alone():
     labels[8:120, 8:120] = 0
     offs, slps, ctr, rms = component_planes(lab, labels, 1)
     assert float(rms[0]) > 2.0, "a curved block is not planar"
+
+
+def _silhouette() -> np.ndarray:
+    """Opaque square in the middle, a 1 px anti-aliasing ring, transparent elsewhere.
+
+    The transparent pixels carry the garbage colour real cut-outs have (black here, white there),
+    and the ring is the blend that must survive.
+    """
+    img = np.zeros((32, 32, 4), np.uint8)
+    img[8:24, 8:24] = (200, 60, 90, 255)
+    img[7, 7:25] = img[24, 7:25] = (200, 60, 90, 128)
+    img[7:25, 7] = img[7:25, 24] = (200, 60, 90, 128)
+    img[..., 3][0, 0] = 0
+    img[0, 0, :3] = (255, 255, 255)  # garbage white
+    img[31, 31, :3] = (0, 0, 0)
+    return img
+
+
+def test_flatten_composites_onto_the_colour_instead_of_painting_it():
+    """Transparent pixels must land exactly on the colour, whatever garbage their RGB holds."""
+    colour = (12, 34, 56)
+    out = flatten(_silhouette(), colour)
+    assert (out[..., 3] == 255).all()  # opaque
+    assert tuple(out[0, 0, :3]) == colour  # was garbage white
+    assert tuple(out[31, 31, :3]) == colour  # was garbage black
+    assert tuple(out[1, 1, :3]) == colour
+
+
+def test_flatten_keeps_the_anti_aliasing_ramp_light():
+    """A half-transparent black pixel over white is ~127, not 0: no black fringe."""
+    img = np.zeros((4, 4, 4), np.uint8)
+    img[..., :3] = (0, 0, 0)
+    img[..., 3] = 0
+    img[1, 1] = (0, 0, 0, 128)
+    out = flatten(img, (255, 255, 255))
+    assert abs(int(out[1, 1, 0]) - 127) <= 1
+    assert tuple(out[1, 1, :3]) == (127, 127, 127) or tuple(out[1, 1, :3]) == (128, 128, 128)
+
+
+def test_flatten_agrees_with_pillows_alpha_composite():
+    """Two independent compositors, one contract (PIL rounds in integer math, hence the +-1)."""
+    rng = np.random.default_rng(3)
+    img = rng.integers(0, 256, (48, 48, 4), dtype=np.uint8)
+    for colour in ((255, 255, 255), (0, 0, 0), (12, 34, 56)):
+        ours = flatten(img, colour)[..., :3].astype(np.int16)
+        bg = Image.new("RGBA", (48, 48), (*colour, 255))
+        theirs = np.asarray(Image.alpha_composite(bg, Image.fromarray(img, "RGBA")))[..., :3].astype(np.int16)
+        assert np.abs(ours - theirs).max() <= 1
+
+
+def test_flatten_via_the_pipeline_only_adds_the_background():
+    """End to end: flattening an image leaves every opaque pixel alone."""
+    rgb = mottled_flat_block(np.array([180, 120, 90]), size=96, seed=5)
+    rgba = rgba_from(rgb, alpha=255)
+    rgba[:20, :20, 3] = 0  # a transparent corner
+    rgba[:20, :20, :3] = 0
+    clear, _ = clean(rgba, Options(alpha_mode="normalize"))
+    flat, info = clean(rgba, Options(alpha_mode="flatten", bg_color=(20, 40, 60)))
+    assert info["alpha_mode"] == "flatten" and info["bg_color"] == [20, 40, 60]
+    assert (flat[..., 3] == 255).all()
+    assert tuple(flat[5, 5, :3]) == (20, 40, 60)
+    opaque = rgba[..., 3] == 255
+    assert np.array_equal(flat[..., :3][opaque], clear[..., :3][opaque])
+
+
+def test_parse_color_accepts_the_forms_the_cli_documents():
+    assert parse_color("#101820") == (16, 24, 32)
+    assert parse_color("101820") == (16, 24, 32)
+    assert parse_color("#f00") == (255, 0, 0)
+    assert parse_color("white") == (255, 255, 255)
+    assert parse_color(" BLACK ") == (0, 0, 0)
+    assert parse_color((1, 2, 3)) == (1, 2, 3)
+    for bad in ("", "#12345", "rgb(1,2,3)", "teal", (1, 2, 300)):
+        with pytest.raises(ValueError):
+            parse_color(bad)
+
+
+def test_the_report_composites_the_original_for_a_flattened_output():
+    """Otherwise the intended background replacement would dominate every change statistic."""
+    rgb = mottled_flat_block(np.array([200.0, 200.0, 200.0]), size=64, seed=1)
+    rgba = rgba_from(rgb, alpha=255)
+    rgba[20:44, 20:44, 3] = 90  # a half-transparent patch with a dark RGB, as real cut-outs have
+    rgba[20:44, 20:44, :3] = 40
+    flat, _ = clean(rgba, Options(alpha_mode="flatten", bg_color=(255, 255, 255)))
+
+    naive = image_metrics(rgba, flat)
+    honest = image_metrics(rgba, flat, composite_original=(255, 255, 255))
+    assert naive["max_abs_delta_levels"] > 50  # the patch lighting up is the point of the mode
+    assert honest["max_abs_delta_levels"] < naive["max_abs_delta_levels"] / 5
+    assert honest["original_composited"] == [255, 255, 255] and naive["original_composited"] is None
+    # the content mask is the raw original's in both cases, so the numbers stay comparable
+    assert honest["pixels_valid"] == naive["pixels_valid"]

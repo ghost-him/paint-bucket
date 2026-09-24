@@ -14,6 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from .color import lab_delta, luma, srgb_to_lab
+from .pipeline import flatten
 from .ops import box_mean, gradient_magnitude, local_spread, robust_sigma_luma
 
 FLAT_TILE = 32
@@ -40,14 +41,33 @@ def _median_filter_radius9_scalar(x: np.ndarray, chunk: int = 192) -> np.ndarray
     return out
 
 
-def image_metrics(orig_rgba: np.ndarray, out_rgba: np.ndarray, tiles: int = 8) -> dict:
-    """The measured acceptance numbers (see README "如何验收")."""
+def image_metrics(
+    orig_rgba: np.ndarray,
+    out_rgba: np.ndarray,
+    tiles: int = 8,
+    background: tuple[int, int, int] = (255, 255, 255),
+    composite_original: tuple[int, int, int] | None = None,
+) -> dict:
+    """The measured acceptance numbers (see README "如何验收").
+
+    `background` is the page both images are composited on for the "rendered" rows (white by
+    default; a flattened output should be measured on its own background).
+
+    `composite_original`, when given, first composites the ORIGINAL onto that colour, so a flattened
+    output is compared like for like.  Without it the half-transparent pixels would look like a
+    199-level change (the background replacement this mode is *for*) and would hide the real
+    question: how gently the opaque content moved.  The content mask stays the original one
+    (alpha >= 24 on the raw original) in both cases, so the numbers remain comparable with the
+    published baseline.
+    """
     orig = np.asarray(orig_rgba)
     out = np.asarray(out_rgba)
     if orig.shape != out.shape:
         raise ValueError("images must have the same shape")
     h, w, _ = orig.shape
     valid = orig[..., 3] >= MIN_ALPHA
+    if composite_original is not None:
+        orig = flatten(orig, composite_original)
 
     lo = luma(orig[..., :3].astype(np.float32))
     lc = luma(out[..., :3].astype(np.float32))
@@ -89,10 +109,12 @@ def image_metrics(orig_rgba: np.ndarray, out_rgba: np.ndarray, tiles: int = 8) -
     # Coverage for everything the masked numbers cannot see: alpha compositing on a white page
     # over EVERY pixel. The masked rows above once hid a real artefact class (alpha in [8,24)
     # whose RGB was written black: 1166 px changed by >8 levels, worst 21.4 — invisible above).
-    dren = np.abs(_rendered_luma(out) - _rendered_luma(orig))
+    dren = np.abs(_rendered_luma(out, background) - _rendered_luma(orig, background))
     return {
         "size": [w, h],
         "pixels_valid": int(v.sum()),
+        "render_background": [int(v) for v in background],
+        "original_composited": None if composite_original is None else [int(v) for v in composite_original],
         "rendered_max_abs_delta_levels": round(float(dren.max()), 3),
         "rendered_mean_abs_delta_levels": round(float(dren.mean()), 3),
         "rendered_p99_abs_delta_levels": round(float(np.percentile(dren, 99)), 3),
@@ -119,18 +141,49 @@ def image_metrics(orig_rgba: np.ndarray, out_rgba: np.ndarray, tiles: int = 8) -
     }
 
 
-def _white_bg(np_rgba: np.ndarray) -> Image.Image:
+def _page_label(m: dict) -> str:
+    """How to name the background in :func:`metrics_text` (kept as "white page" for the default)."""
+    bg = tuple(m.get("render_background", (255, 255, 255)))
+    return "a white page" if bg == (255, 255, 255) else f"a {bg} page"
+
+
+def metrics_text(m: dict) -> str:
+    """Human-readable summary of :func:`image_metrics`, shared by the CLI and the GUI."""
+    return "\n".join(
+        [
+            f"  flattest tiles ({len(m['flat_tiles'])}x 32x32): std {m['flat_tile_std_before_mean']} -> "
+            f"{m['flat_tile_std_after_mean']} mean, {m['flat_tile_std_after_median']} median; "
+            f"{m['flat_tiles_cleaned']} are now flat (std<=0.1); worst colour bias "
+            f"{m['flat_tile_bias_absmax']} levels",
+            f"  local variation on flat pixels: {m['local_variation_flat_px_before']} -> "
+            f"{m['local_variation_flat_px_after']}",
+            f"  grain sigma (levels): {m['sigma_grain_before_levels']} -> {m['sigma_grain_after_levels']}",
+            f"  luma corr {m['corr_luma']}  mean|d| {m['mean_abs_delta_levels']}  "
+            f"p99|d| {m['p99_abs_delta_levels']}  max|d| {m['max_abs_delta_levels']}",
+            f"  pixels changed >2 levels {100 * m['frac_gt2_levels']:.2f}%  "
+            f">8 levels {100 * m['frac_gt8_levels']:.2f}%",
+            f"  on {_page_label(m)}, every pixel: max|d| {m['rendered_max_abs_delta_levels']}  "
+            f"p99 {m['rendered_p99_abs_delta_levels']}  mean {m['rendered_mean_abs_delta_levels']}  "
+            f">8 levels {100 * m['rendered_frac_gt8_levels']:.3f}%",
+        ]
+    )
+
+
+def _solid_bg(np_rgba: np.ndarray, background: tuple[int, int, int] = (255, 255, 255)) -> Image.Image:
     img = Image.fromarray(np_rgba, "RGBA")
-    bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+    bg = Image.new("RGBA", img.size, (int(background[0]), int(background[1]), int(background[2]), 255))
     return Image.alpha_composite(bg, img).convert("RGB")
 
 
-def _rendered_luma(np_rgba: np.ndarray) -> np.ndarray:
-    """Luma of the image as a viewer sees it on a white page, for every pixel including the
+def _rendered_luma(
+    np_rgba: np.ndarray, background: tuple[int, int, int] = (255, 255, 255)
+) -> np.ndarray:
+    """Luma of the image as a viewer sees it on `background`, for every pixel including the
     transparent ones (alpha compositing, exact)."""
     a = np_rgba[..., 3].astype(np.float32) / 255.0
     rgb = np_rgba[..., :3].astype(np.float32)
-    return luma(255.0 - a[..., None] * (255.0 - rgb))
+    page = np.asarray(background, dtype=np.float32)[None, None, :]
+    return luma(page - a[..., None] * (page - rgb))
 
 
 def _boost(img: Image.Image) -> tuple[Image.Image, float]:
@@ -202,12 +255,13 @@ def write_comparison(
     crops: list[tuple[int, int, int, int]] | None = None,
     zoom: int = 3,
     overview_height: int = 700,
+    background: tuple[int, int, int] = (255, 255, 255),
 ) -> list[Path]:
     """Write `overview.png` plus one figure per detail crop; returns the file paths."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    before = _white_bg(np.asarray(orig_rgba))
-    after = _white_bg(np.asarray(out_rgba))
+    before = _solid_bg(np.asarray(orig_rgba), background)
+    after = _solid_bg(np.asarray(out_rgba), background)
     written: list[Path] = []
 
     # ---- overview: whole image, before | after
