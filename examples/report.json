@@ -1,0 +1,97 @@
+{
+  "info": {
+    "input": "avator.png",
+    "cleaned": "avator-clean.png"
+  },
+  "metrics": {
+    "size": [
+      1254,
+      1254
+    ],
+    "pixels_valid": 1247957,
+    "render_background": [
+      255,
+      255,
+      255
+    ],
+    "original_composited": null,
+    "rendered_max_abs_delta_levels": 8.034,
+    "rendered_mean_abs_delta_levels": 1.112,
+    "rendered_p99_abs_delta_levels": 4.553,
+    "rendered_frac_gt8_levels": 0.0,
+    "sigma_grain_before_levels": 0.2089,
+    "sigma_grain_after_levels": 0.0,
+    "flat_tiles": [
+      {
+        "x": 1092,
+        "y": 228,
+        "std_before": 0.324,
+        "std_after": 0.054,
+        "bias_levels": -0.015
+      },
+      {
+        "x": 1156,
+        "y": 1156,
+        "std_before": 0.363,
+        "std_after": 0.081,
+        "bias_levels": 0.117
+      },
+      {
+        "x": 676,
+        "y": 868,
+        "std_before": 0.395,
+        "std_after": 0.364,
+        "bias_levels": -0.056
+      },
+      {
+        "x": 1188,
+        "y": 1156,
+        "std_before": 0.4,
+        "std_after": 0.1,
+        "bias_levels": 0.122
+      },
+      {
+        "x": 1060,
+        "y": 228,
+        "std_before": 0.4,
+        "std_after": 0.18,
+        "bias_levels": 0.079
+      },
+      {
+        "x": 644,
+        "y": 580,
+        "std_before": 0.406,
+        "std_after": 0.375,
+        "bias_levels": 0.085
+      },
+      {
+        "x": 1156,
+        "y": 1124,
+        "std_before": 0.409,
+        "std_after": 0.376,
+        "bias_levels": 0.015
+      },
+      {
+        "x": 1060,
+        "y": 1028,
+        "std_before": 0.412,
+        "std_after": 0.227,
+        "bias_levels": 0.122
+      }
+    ],
+    "flat_tile_std_before_mean": 0.389,
+    "flat_tile_std_after_mean": 0.22,
+    "flat_tile_std_after_median": 0.204,
+    "flat_tiles_cleaned": 3,
+    "flat_tile_bias_absmax": 0.122,
+    "local_variation_flat_px_before": 0.2666,
+    "local_variation_flat_px_after": 0.0548,
+    "corr_luma": 0.999925,
+    "mean_abs_delta_levels": 0.634,
+    "p99_abs_delta_levels": 3.928,
+    "max_abs_delta_levels": 8.0,
+    "frac_gt2_levels": 0.05022,
+    "frac_gt8_levels": 0.0,
+    "max_deltaE_flat_px": 1.635
+  }
+}
