@@ -22,12 +22,16 @@ from .ops import (
     any_in_window,
     bilateral,
     component_means,
+    component_planes,
     dilate,
     erode,
     grow_labels,
+    grow_planes,
     label_components,
     masked_box_mean,
     merge_close_labels,
+    merge_close_planes,
+    plane_field,
     robust_sigma_luma,
 )
 
@@ -47,10 +51,17 @@ class Options:
     merge_tol: float = 1.0  # adjacent blocks closer than this (dE) share one colour
     close_radius: int = 2  # morphological closing radius for the flat mask (fills pinholes)
     radius: int | None = None  # None = auto from image size
-    stride: int = 2  # offset subsampling inside the bilateral window
+    # 1 = every tap of the window (default). Measured on the reference image at equal wall time,
+    # stride 1 with a smaller radius beats stride 2 with a bigger one on every purity axis
+    # (flat-pixel variation 0.0591 vs 0.0758, uniform 3x3 neighbourhoods 0.528 vs 0.496 at ~2 s),
+    # and it never touched the real gradients (blush correlation 0.9993 for every setting).
+    stride: int = 1  # offset subsampling inside the bilateral window
     sigma_grain: float | None = None  # None = measure it
     alpha_mode: str = "normalize"  # "normalize" | "keep"
     aa_band: int = 2  # px of the flat mask eroded before snapping (protects anti-aliasing)
+    snap_mode: str = "plane"  # "plane" = fit a plane per block, "constant" = one colour per block
+    plane_tol: float = 4.0  # keep a block if its plane residual <= plane_tol x the median residual
+    slope_tol: float = 0.05  # max slope difference (dE/px) for two adjacent blocks to merge
 
 
 def auto_radius(width: int, height: int) -> int:
@@ -103,17 +114,44 @@ def clean(rgba: np.ndarray, opts: Options | None = None) -> tuple[np.ndarray, di
         if count:
             sizes = np.bincount(labels.ravel()[labels.ravel() >= 0], minlength=count)
             keep = sizes >= opts.min_block
-            means = component_means(out_lab, labels, count)
-            if keep.any():
-                # grow each block over the rest of the image, but only over pixels that are still
-                # within snap_tol of the block's mean: the block reaches its true border and every
-                # pixel in it finally gets exactly the same colour
-                labels = grow_labels(out_lab, labels, means, valid & keep[labels.clip(0)], opts.snap_tol)
-                labels, means = merge_close_labels(labels, means, out_lab, opts.merge_tol)
-                sel = labels >= 0
-                out_lab = np.where(sel[..., None], means[labels.clip(0)], out_lab)
-                snapped_px = int(sel.sum())
-                snapped_blocks = int(means.shape[0])
+            if opts.snap_mode == "plane":
+                # A block is not always one colour: repainting a ramp with a constant turns it into a
+                # staircase (the measured cost of the constant mode). A plane follows the ramp and
+                # still averages the zero-mean mottle away; blocks whose plane leaves a residual are
+                # left to the denoiser, and blocks that leaked across a real edge are rejected by the
+                # same test.
+                offs, slps, ctr, rms = component_planes(out_lab, labels, count)
+                # "Planar" is judged RELATIVE to the other blocks, not by an absolute number: the
+                # residual of a typical block is the leftover cloud, i.e. exactly what we want to
+                # average away, while a curved shading ramp or a block that leaked across an edge
+                # fits far worse. An absolute threshold would do the opposite and reject the
+                # noisiest - i.e. the most in-need-of-repainting - blocks (measured: with tol=1.0
+                # the 8 flattest tiles went from 7/8 clean to 4/8).
+                ref = float(np.median(rms[keep])) if keep.any() else 0.0
+                tol = max(0.5, opts.plane_tol * ref)
+                seeds = valid & keep[labels.clip(0)] & (rms <= tol)[labels.clip(0)]
+                if seeds.any():
+                    labels = grow_planes(out_lab, labels, offs, slps, ctr, seeds, opts.snap_tol)
+                    labels, offs, slps, ctr = merge_close_planes(
+                        labels, offs, slps, ctr, out_lab, opts.merge_tol, opts.slope_tol
+                    )
+                    sel = labels >= 0
+                    planes = plane_field((h, w), labels.clip(0), offs, slps, ctr)
+                    out_lab = np.where(sel[..., None], planes, out_lab)
+                    snapped_px = int(sel.sum())
+                    snapped_blocks = int(offs.shape[0])
+            else:
+                means = component_means(out_lab, labels, count)
+                if keep.any():
+                    # grow each block over the rest of the image, but only over pixels that are still
+                    # within snap_tol of the block's mean: the block reaches its true border and every
+                    # pixel in it finally gets exactly the same colour
+                    labels = grow_labels(out_lab, labels, means, valid & keep[labels.clip(0)], opts.snap_tol)
+                    labels, means = merge_close_labels(labels, means, out_lab, opts.merge_tol)
+                    sel = labels >= 0
+                    out_lab = np.where(sel[..., None], means[labels.clip(0)], out_lab)
+                    snapped_px = int(sel.sum())
+                    snapped_blocks = int(means.shape[0])
 
     # ---- back to sRGB 8 bit
     out = np.empty_like(src)

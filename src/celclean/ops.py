@@ -490,3 +490,196 @@ def merge_close_labels(
         sums[:, c] = np.bincount(idx, weights=lab[..., c].ravel()[sel], minlength=new_n)
     counts = np.maximum(np.bincount(idx, minlength=new_n), 1).astype(np.float64)
     return new_labels, (sums / counts[:, None]).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------- block planes
+# A flat block is not always a constant colour: in cel-shaded art a block is just as often a
+# gentle ramp (cheek shading, hair shading). Repainting such a block with ONE colour therefore
+# turns its ramp into a staircase (measured on the reference image: 220 hard 1-level steps in the
+# blush window, longest plateau 120 px). Fitting a plane per block fixes both problems at once:
+# the ramp is followed, while the mottle - which is zero-mean inside the block - is averaged away.
+
+
+def component_planes(
+    lab: np.ndarray, labels: np.ndarray, count: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Least-squares plane per label, one per channel.
+
+    Fits `v ~ offset + dy*(y-cy) + dx*(x-cx)` on the pixels of each label and returns
+    `(offsets (count,3), slopes (count,2,3) [dy, dx], centres (count,2) [cy, cx], rms (count,))`
+    where `rms` is the worst channel's residual RMS in Lab units — the caller rejects blocks that
+    are not actually planar (a curved shading ramp, or a block that leaked across an edge).
+    Degenerate shapes (a 1-px-wide strip) fall back to slope 0, i.e. the constant behaviour.
+    """
+    lab = np.asarray(lab, np.float32)
+    h, w, _ = lab.shape
+    flat_labels = labels.ravel()
+    sel = flat_labels >= 0
+    if not sel.any():
+        z = np.zeros((0, 3), np.float32)
+        return z, np.zeros((0, 2, 3), np.float32), np.zeros((0, 2), np.float32), np.zeros(0, np.float32)
+    lid = flat_labels[sel].astype(np.int64)
+    pos = np.nonzero(sel)[0]
+    ys = (pos // w).astype(np.float64)
+    xs = (pos % w).astype(np.float64)
+    n = np.maximum(np.bincount(lid, minlength=count).astype(np.float64), 1.0)
+    cy = np.bincount(lid, weights=ys, minlength=count) / n
+    cx = np.bincount(lid, weights=xs, minlength=count) / n
+    dy_, dx_ = ys - cy[lid], xs - cx[lid]
+    # second moments about the block centre, per pixel (so no cancellation of large coordinates)
+    mxx = np.bincount(lid, weights=dx_ * dx_, minlength=count) / n
+    myy = np.bincount(lid, weights=dy_ * dy_, minlength=count) / n
+    mxy = np.bincount(lid, weights=dy_ * dx_, minlength=count) / n
+    det = mxx * myy - mxy * mxy
+    usable = det > 1e-4  # a strip/point shape has no determinable slope
+    det_safe = np.where(usable, det, 1.0)
+
+    offsets = np.empty((count, 3), np.float64)
+    slopes = np.zeros((count, 2, 3), np.float64)
+    rms = np.zeros(count, np.float64)
+    for c in range(3):
+        v = lab[..., c].ravel()[sel].astype(np.float64)
+        vc = np.bincount(lid, weights=v, minlength=count) / n
+        dv = v - vc[lid]
+        b_x = np.bincount(lid, weights=dv * dx_, minlength=count) / n
+        b_y = np.bincount(lid, weights=dv * dy_, minlength=count) / n
+        dxs = (myy * b_x - mxy * b_y) / det_safe
+        dys = (mxx * b_y - mxy * b_x) / det_safe
+        dxs = np.where(usable, dxs, 0.0)
+        dys = np.where(usable, dys, 0.0)
+        offsets[:, c] = vc
+        slopes[:, 0, c] = dys
+        slopes[:, 1, c] = dxs
+        err = dv - (dys[lid] * dy_ + dxs[lid] * dx_)
+        rms = np.maximum(rms, np.sqrt(np.bincount(lid, weights=err * err, minlength=count) / n))
+    return (
+        offsets.astype(np.float32),
+        slopes.astype(np.float32),
+        np.stack([cy, cx], axis=1).astype(np.float32),
+        rms.astype(np.float32),
+    )
+
+
+def plane_field(
+    shape: tuple[int, int], labels: np.ndarray, offsets: np.ndarray, slopes: np.ndarray, centres: np.ndarray
+) -> np.ndarray:
+    """Evaluate every pixel's plane prediction -> (H, W, 3) float32."""
+    h, w = shape
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    idx = np.clip(np.asarray(labels, np.int32), 0, offsets.shape[0] - 1)
+    out = offsets[idx] + slopes[idx][..., 0, :] * (yy - centres[idx][..., 0])[..., None]
+    out += slopes[idx][..., 1, :] * (xx - centres[idx][..., 1])[..., None]
+    return out
+
+
+def grow_planes(
+    lab: np.ndarray,
+    labels: np.ndarray,
+    offsets: np.ndarray,
+    slopes: np.ndarray,
+    centres: np.ndarray,
+    seeds: np.ndarray,
+    tol: float,
+    iterations: int | None = None,
+) -> np.ndarray:
+    """Grow components while the pixel stays within `tol` of the component's PLANE.
+
+    Same contract as `grow_labels`, except the acceptance test follows the block's plane, so a
+    ramped block keeps growing along its ramp instead of stopping at the first 1-level step.
+    """
+    lab = np.asarray(lab, np.float32)
+    h, w, _ = lab.shape
+    out = np.where(seeds, np.asarray(labels, np.int32), -1).astype(np.int32)
+    n = int(offsets.shape[0])
+    if n == 0:
+        return out
+    iterations = iterations or max(16, min(48, h // 32 + 8))
+    yy = np.arange(h, dtype=np.float32)[:, None]
+    xx = np.arange(w, dtype=np.float32)[None, :]
+    pad = np.empty((h + 2, w + 2), np.int32)
+    for _ in range(iterations):
+        unknown = out < 0
+        if not unknown.any():
+            break
+        pad.fill(-1)
+        pad[1:-1, 1:-1] = out
+        best_d = np.full((h, w), np.inf, np.float32)
+        best_l = np.full((h, w), -1, np.int32)
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nb = pad[1 + dy : 1 + dy + h, 1 + dx : 1 + dx + w]
+            ok = (nb >= 0) & unknown
+            if not ok.any():
+                continue
+            v = nb.clip(0, n - 1)
+            pred = offsets[v] + slopes[v][..., 0, :] * (yy - centres[v][..., 0])[..., None]
+            pred += slopes[v][..., 1, :] * (xx - centres[v][..., 1])[..., None]
+            d = np.abs(lab - pred).max(-1)
+            better = ok & (d < best_d)
+            best_d = np.where(better, d, best_d)
+            best_l = np.where(better, nb, best_l)
+        grow = unknown & (best_d <= tol)
+        n_grow = int(grow.sum())
+        if n_grow == 0 or n_grow < 0.001 * grow.size:
+            break
+        out = np.where(grow, best_l, out)
+    return out
+
+
+def merge_close_planes(
+    labels: np.ndarray,
+    offsets: np.ndarray,
+    slopes: np.ndarray,
+    centres: np.ndarray,
+    lab: np.ndarray,
+    tol: float,
+    slope_tol: float,
+    passes: int = 3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Merge adjacent components whose planes agree (offset within `tol`, slopes within `slope_tol`).
+
+    Neighbouring pieces of one physical ramp get separate planes that differ slightly, and painting
+    them separately would leave a seam; the plane is re-fitted after every merge pass because
+    merging two pieces changes both the offset and the slope.
+    """
+    labels = np.asarray(labels, np.int32)
+    n = int(offsets.shape[0])
+    if n == 0:
+        return labels, offsets, slopes, centres
+    h, w = labels.shape
+    for _ in range(passes):
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        merged = False
+        for dy, dx in ((0, 1), (1, 0)):
+            a = labels[: h - dy or None, : w - dx or None]
+            b = labels[dy:, dx:]
+            m = (a >= 0) & (b >= 0) & (a != b)
+            if not m.any():
+                continue
+            pairs = np.unique(np.stack([a[m].ravel(), b[m].ravel()], axis=1), axis=0)
+            for u, v in pairs.tolist():
+                ru, rv = find(u), find(v)
+                if ru == rv:
+                    continue
+                d_off = float(np.abs(offsets[ru] - offsets[rv]).max())
+                d_slo = float(np.abs(slopes[ru] - slopes[rv]).max())
+                if d_off <= tol and d_slo <= slope_tol:
+                    parent[rv] = ru
+                    merged = True
+        if not merged:
+            break
+        roots = np.array([find(i) for i in range(n)], np.int32)
+        _, inv = np.unique(roots, return_inverse=True)
+        labels = np.where(labels >= 0, inv[labels.clip(0)].astype(np.int32), np.int32(-1))
+        n = int(inv.max()) + 1
+        offsets, slopes, centres, _ = component_planes(lab, labels, n)
+    return labels, offsets, slopes, centres

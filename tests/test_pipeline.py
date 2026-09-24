@@ -208,3 +208,73 @@ def test_alpha_below_min_keeps_its_colour():
     assert out[2, 2, 3] == 20
     assert tuple(out[60, 60, :3]) == (0, 0, 0)
     assert out[60, 60, 3] == 0
+
+
+# ------------------------------------------------------------------ flat-block plane model
+
+
+def _ramp_block(size=256, lo=100.0, hi=140.0, box=(16, 16, 224, 224)) -> np.ndarray:
+    """A block whose green channel ramps linearly -- a "cheek shading" block."""
+    x, y, w, h = box
+    img = np.zeros((size, size, 4), dtype=np.uint8)
+    img[y : y + h, x : x + w, 0] = 180
+    img[y : y + h, x : x + w, 1] = np.rint(np.linspace(lo, hi, w)).astype(np.uint8)
+    img[y : y + h, x : x + w, 2] = 150
+    img[y : y + h, x : x + w, 3] = 255
+    return img
+
+
+def test_plane_snap_follows_a_ramp_that_constant_snap_flattens():
+    """A ramp block is the one case where the constant repaint is catastrophic: it paints the whole
+    ramp one colour (measured on a synthetic 40-level ramp: residual 11.1 vs 2.1 levels). The plane
+    model must follow it instead."""
+    img = _ramp_block()
+    x, y, w, h = 16, 16, 224, 224
+    row = slice(y + h // 2, y + h // 2 + 1)
+    core = (row, slice(x + 4, x + w - 4))
+    ideal = np.linspace(100.0, 140.0, w)[4:-4]
+
+    flat, _ = clean(img, Options(radius=12, snap=True, snap_mode="constant", snap_tol=1.0))
+    plane, _ = clean(img, Options(radius=12, snap=True, snap_mode="plane", snap_tol=1.0))
+
+    flat_row = flat[core][0, :, 1].astype(np.float64)
+    plane_row = plane[core][0, :, 1].astype(np.float64)
+    assert flat_row.std() < 2.0, "the constant model is expected to flatten the ramp"
+    assert plane_row.std() > 0.8 * ideal.std(), "the plane model must keep the ramp"
+    assert np.corrcoef(plane_row, ideal)[0, 1] > 0.98
+
+
+def test_component_planes_recovers_an_exact_plane():
+    from celclean.ops import component_planes
+
+    lab = np.zeros((24, 32, 3), np.float32)
+    yy, xx = np.mgrid[0:24, 0:32]
+    lab[..., 0] = 10.0 + 0.5 * yy + 0.25 * xx
+    lab[..., 1] = 20.0 - 0.3 * yy
+    lab[..., 2] = 5.0 + 0.1 * xx
+    labels = np.full((24, 32), -1, np.int32)
+    labels[4:20, 4:28] = 0
+
+    offs, slps, ctr, rms = component_planes(lab, labels, 1)
+
+    assert float(rms[0]) < 1e-3
+    assert abs(float(offs[0, 0]) - (10.0 + 0.5 * ctr[0, 0] + 0.25 * ctr[0, 1])) < 1e-3
+    assert abs(float(slps[0, 0, 0]) - 0.5) < 1e-3  # d/dy
+    assert abs(float(slps[0, 1, 0]) - 0.25) < 1e-3  # d/dx
+    assert abs(float(slps[0, 0, 1]) + 0.3) < 1e-3
+    assert abs(float(slps[0, 1, 2]) - 0.1) < 1e-3
+
+
+def test_plane_snap_leaves_a_non_planar_block_alone():
+    """A block that a plane cannot describe (here: strong curvature) must not be repainted -- the
+    relative-residual guard rejects it while the surrounding flat blocks are still repainted."""
+    from celclean.ops import component_planes
+
+    size = 128
+    yy, xx = np.mgrid[0:size, 0:size]
+    curved = (60.0 + 40.0 * ((yy / size - 0.5) ** 2 * 4)).astype(np.float32)
+    lab = np.stack([curved, curved, curved], axis=-1)
+    labels = np.full((size, size), -1, np.int32)
+    labels[8:120, 8:120] = 0
+    offs, slps, ctr, rms = component_planes(lab, labels, 1)
+    assert float(rms[0]) > 2.0, "a curved block is not planar"

@@ -50,6 +50,9 @@ def _options(args: argparse.Namespace) -> Options:
         sigma_grain=args.sigma,
         alpha_mode=args.alpha,
         aa_band=args.aa_band,
+        snap_mode=args.snap_mode,
+        plane_tol=args.plane_tol,
+        slope_tol=args.slope_tol,
     )
 
 
@@ -138,18 +141,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "worst-case change (max |d| 7.0 -> 21.3 levels at 3.0); for purer blocks "
                              "use --stride 1 or --snap")
         sp.add_argument("--snap", action=argparse.BooleanOptionalAction, default=False,
-                        help="repaint each connected flat block with exactly one colour; gives pure "
-                             "blocks but turns gentle shading into visible steps (default: off)")
+                        help="repaint each connected flat block with its own colour instead of "
+                             "averaging: purest blocks (flat std 0.227 -> 0.045, 7/8 windows flat) but "
+                             "large gentle gradients pick up hard-edged patches (verified visually at "
+                             "1-2 level differences), so it stays off by default")
         sp.add_argument("--snap-tol", type=float, default=0.5,
                         help="max distance (dE) from the local mean that still counts as flat; "
                              "lower = keep more shading (default: 0.5)")
         sp.add_argument("--min-block", type=int, default=64,
                         help="blocks smaller than this many px are left to the denoiser (default: 64)")
         sp.add_argument("--radius", type=int, default=None, help="core window radius in px (default: auto)")
-        sp.add_argument("--stride", type=int, default=2,
-                        help="window sampling step (default: 2). 1 = 4x more taps and the measured "
-                             "quality work point: flat-pixel variation 0.0871 -> 0.0611, pure 3x3 "
-                             "neighbours 0.350 -> 0.463, max |d| 7.0 -> 8.0, ~3.4x the time")
+        sp.add_argument("--stride", type=int, default=1,
+                        help="window sampling step (default: 1). 1 = every tap: the measured quality "
+                             "work point (flat-pixel variation 0.0548 vs 0.0807, uniform 3x3 "
+                             "neighbourhoods 0.554 vs 0.464, worst-case change 7.0 -> 8.0 levels) at "
+                             "~3.4x the time; use 2 to trade purity back for speed")
         sp.add_argument("--sigma", type=float, default=None, help="override the measured grain sigma (Lab L units)")
         sp.add_argument("--alpha", choices=["normalize", "keep"], default="normalize",
                         help="normalize: interior alpha -> 255 (default). This changes more pixels "
@@ -158,6 +164,17 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--aa-band", type=int, default=2,
                         help="px of edge kept un-snapped (default: 2); has an effect only together "
                              "with --snap (with snap off the output is byte-identical)")
+        sp.add_argument("--snap-mode", choices=["plane", "constant"], default="plane",
+                        help="with --snap: 'plane' fits a plane per block (follows gentle ramps, so "
+                             "no staircase) while 'constant' paints one colour per block (default: plane)")
+        sp.add_argument("--plane-tol", type=float, default=4.0,
+                        help="with --snap-mode plane: keep a block if its plane residual is at most "
+                             "this many times the median block residual (floor 0.5 dE); blocks that "
+                             "fit far worse (curved shading, leaked edges) are left to the denoiser "
+                             "(default: 4.0)")
+        sp.add_argument("--slope-tol", type=float, default=0.05,
+                        help="max slope difference (dE/px) for two adjacent blocks to be merged in "
+                             "--snap-mode plane (default: 0.05)")
 
     c = sub.add_parser("clean", help="clean an image")
     c.add_argument("input")
